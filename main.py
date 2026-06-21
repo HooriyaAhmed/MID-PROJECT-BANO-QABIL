@@ -4,7 +4,10 @@ from datetime import date
 import hashlib
 from getpass import getpass
 
-
+MONTH_NAMES = [
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
 
 #Database Query and Connection
 
@@ -203,6 +206,179 @@ def show_table(data):
     print("====================================================\n")
 
 
+# PDF EXPORT
+
+
+def generate_pdf_report(uid):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import cm
+    except ImportError:
+        print("\nreportlab not installed. Run: pip install reportlab")
+        return
+
+    print("\n========== GENERATE PDF REPORT ==========")
+    today = date.today()
+
+    # year input
+    while True:
+        year_input = input(f"Please enter the year & leave blank to use current year[{today.year}]: ").strip() or str(today.year)
+        try:
+            year = int(year_input)
+            if 2000 <= year <= 2100:
+                break
+            print("Enter a valid year (2000-2100).")
+        except:
+            print("Year must be a number.")
+
+    # month input
+    while True:
+        month_input = input(f"Please enter the month (1-12) or press Enter to use current month[{today.month}]").strip() or str(today.month)
+        try:
+            month = int(month_input)
+            if 1 <= month <= 12:
+                break
+            print("Month must be between 1 and 12.")
+        except:
+            print("Month must be a number.")
+
+    month_name = MONTH_NAMES[month]
+
+    # fetch all data inside function
+    conn, cur = connect_db()
+
+    cur.execute("""
+        SELECT id, date, category, description, amount FROM expenses
+        WHERE user_id=? AND strftime('%Y', date)=? AND strftime('%m', date)=?
+        ORDER BY date
+    """, (uid, str(year), f"{month:02d}"))
+    expenses = cur.fetchall()
+
+    cur.execute("""
+        SELECT category, SUM(amount) FROM expenses
+        WHERE user_id=? AND strftime('%Y', date)=? AND strftime('%m', date)=?
+        GROUP BY category ORDER BY SUM(amount) DESC
+    """, (uid, str(year), f"{month:02d}"))
+    cat_totals = cur.fetchall()
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) FROM expenses
+        WHERE user_id=? AND strftime('%Y', date)=? AND strftime('%m', date)=?
+    """, (uid, str(year), f"{month:02d}"))
+    spent = cur.fetchone()[0]
+
+    cur.execute("SELECT username FROM users WHERE id=?", (uid,))
+    username = cur.fetchone()[0]
+
+    conn.close()
+
+    budget    = get_budget(uid)
+    remaining = budget - spent
+
+    if not expenses:
+        print(f"\n⚠  No expenses found for {month_name} {year}.")
+        return
+
+    filename = f"Report_{username}_{month_name}_{year}.pdf"
+    filepath = os.path.join(os.getcwd(), filename)
+
+    doc = SimpleDocTemplate(filepath, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Title
+    story.append(Paragraph(f"Monthly Expense Report - {month_name} {year}", styles["Title"]))
+    story.append(Paragraph(f"User: {username}    Generated: {today}", styles["Normal"]))
+    story.append(Spacer(1, 0.5*cm))
+
+    # Summary
+    story.append(Paragraph("Summary", styles["Heading2"]))
+    if budget > 0:
+        pct = (spent / budget) * 100
+        if spent > budget:
+            status = "OVER BUDGET"
+        elif pct >= 90:
+            status = "CRITICAL (90%+ used)"
+        elif pct >= 70:
+            status = "CAUTION (70%+ used)"
+        else:
+            status = "ON TRACK"
+    else:
+        pct = 0
+        status = "No Budget Set"
+
+    summary_data = [
+        ["Total Spent", "Monthly Budget", "Remaining", "Status"],
+        [
+            f"Rs {spent:,.2f}",
+            f"Rs {budget:,.2f}" if budget > 0 else "Not Set",
+            f"Rs {remaining:,.2f}" if budget > 0 else "-",
+            status
+        ]
+    ]
+    summary_table = Table(summary_data, colWidths=[4*cm, 4*cm, 4*cm, 5*cm])
+    summary_table.setStyle(TableStyle([
+        ("GRID",     (0, 0), (-1, -1), 0.5, (0, 0, 0)),
+        ("FONTNAME", (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("ALIGN",    (0, 0), (-1, -1), "CENTER"),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 0.5*cm))
+
+    # Category Breakdown
+    story.append(Paragraph("Category Breakdown", styles["Heading2"]))
+    cat_rows = [["Category", "Amount (Rs)", "% of Total"]]
+    for cat, amt in cat_totals:
+        share = (amt / spent * 100) if spent > 0 else 0
+        cat_rows.append([cat, f"{amt:,.2f}", f"{share:.1f}%"])
+
+    cat_table = Table(cat_rows, colWidths=[7*cm, 5*cm, 5*cm])
+    cat_table.setStyle(TableStyle([
+        ("GRID",     (0, 0), (-1, -1), 0.5, (0, 0, 0)),
+        ("FONTNAME", (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("ALIGN",    (1, 0), (-1, -1), "CENTER"),
+    ]))
+    story.append(cat_table)
+    story.append(Spacer(1, 0.5*cm))
+
+    # Transaction Details
+    story.append(Paragraph("Transaction Details", styles["Heading2"]))
+    tx_rows = [["ID", "Date", "Category", "Description", "Amount (Rs)"]]
+    for r in expenses:
+        tx_rows.append([str(r[0]), r[1], r[2], r[3], f"{r[4]:,.2f}"])
+
+    tx_table = Table(tx_rows, colWidths=[1.5*cm, 3*cm, 3*cm, 6*cm, 3.5*cm])
+    tx_table.setStyle(TableStyle([
+        ("GRID",     (0, 0), (-1, -1), 0.5, (0, 0, 0)),
+        ("FONTNAME", (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("ALIGN",    (0, 0), (2, -1),  "CENTER"),
+        ("ALIGN",    (4, 0), (4, -1),  "RIGHT"),
+    ]))
+    story.append(tx_table)
+    story.append(Spacer(1, 0.5*cm))
+
+    # same Smart Budget Advisor(same Logic)
+    story.append(Paragraph("Smart Budget Advisor", styles["Heading2"]))
+    if budget == 0:
+        advice = "No budget set. Set a monthly budget to receive spending insights."
+    elif spent > budget:
+        advice = f"OVER BUDGET by Rs {abs(remaining):,.2f}. Stop unnecessary spending immediately."
+    elif pct >= 90:
+        advice = f"CRITICAL: {pct:.1f}% of budget used. Only Rs {remaining:,.2f} left."
+    elif pct >= 70:
+        advice = f"CAUTION: {pct:.1f}% of budget used. Rs {remaining:,.2f} remaining."
+    else:
+        advice = f"ON TRACK: {pct:.1f}% of budget used. Rs {remaining:,.2f} still available."
+    story.append(Paragraph(advice, styles["Normal"]))
+
+    doc.build(story)
+
+    print(f"\n Report generated successfully!")
+    print(f"File: {filepath}")
+
+
 
 #Main 
 
@@ -282,7 +458,8 @@ while True:
 6 Total Expense
 7 Set Budget
 8 Smart Budget Advisor
-9 Exit
+9 Generate PDF Report
+10 Exit
 =====================================
 """)
 
@@ -416,11 +593,14 @@ while True:
 
 
 
- 
+    #PDf
+    elif choice == "9":
+        generate_pdf_report(uid)
+
 
 
     #EXIT
-    elif choice == "9":
+    elif choice == "10":
         print("Goodbye!")
         break
 

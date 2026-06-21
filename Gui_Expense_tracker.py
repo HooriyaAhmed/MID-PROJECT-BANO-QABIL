@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import date
 import re
+import os
 
 
 # DATABASE   
@@ -186,6 +187,430 @@ def show_table(data):
         print(f"{r[0]:<2} | {r[1]:<10} | {r[2]:<10} | {r[3]:<12} | Rs {r[4]}")
     print("====================================================\n")
 
+
+
+# PDF EXPORT  
+
+
+MONTH_NAMES = {
+    1: "January", 2: "February", 3: "March", 4: "April",
+    5: "May", 6: "June", 7: "July", 8: "August",
+    9: "September", 10: "October", 11: "November", 12: "December"
+}
+
+
+def generate_pdf_report(uid, year, month, save_dir=None):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import (
+            SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+        )
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+        from reportlab.pdfgen import canvas as pdf_canvas
+    except ImportError:
+        return False, "reportlab not installed.\nRun: pip install reportlab"
+
+    today = date.today()
+    month_name = MONTH_NAMES[month]
+
+    conn, cur = connect_db()
+
+    cur.execute("""
+        SELECT id, date, category, description, amount FROM expenses
+        WHERE user_id=? AND strftime('%Y', date)=? AND strftime('%m', date)=?
+        ORDER BY date
+    """, (uid, str(year), f"{month:02d}"))
+    expenses = cur.fetchall()
+
+    cur.execute("""
+        SELECT category, SUM(amount) FROM expenses
+        WHERE user_id=? AND strftime('%Y', date)=? AND strftime('%m', date)=?
+        GROUP BY category ORDER BY SUM(amount) DESC
+    """, (uid, str(year), f"{month:02d}"))
+    cat_totals = cur.fetchall()
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) FROM expenses
+        WHERE user_id=? AND strftime('%Y', date)=? AND strftime('%m', date)=?
+    """, (uid, str(year), f"{month:02d}"))
+    spent = cur.fetchone()[0]
+
+    cur.execute("SELECT username FROM users WHERE id=?", (uid,))
+    username = cur.fetchone()[0]
+    conn.close()
+
+    if not expenses:
+        return False, f"No expenses found for {month_name} {year}.\nPlease add expenses first."
+
+    budget    = get_budget(uid)
+    remaining = budget - spent
+
+    filename = f"Report_{username}_{month_name}_{year}.pdf"
+    if save_dir:
+        filepath = os.path.join(save_dir, filename)
+    else:
+        filepath = os.path.join(os.getcwd(), filename)
+
+    # Brand palette (matches the app's UI theme)
+
+    C_ACCENT     = colors.HexColor("#0E7C7B")
+    C_ACCENT_DK  = colors.HexColor("#0A6362")
+    C_ACCENT_BG  = colors.HexColor("#E8F4F3")
+    C_INK        = colors.HexColor("#2B2620")
+    C_SUBTLE     = colors.HexColor("#7A7266")
+    C_BORDER     = colors.HexColor("#E3DDD0")
+    C_ROW_ALT    = colors.HexColor("#F7F4ED")
+    C_GREEN      = colors.HexColor("#2F9E5B")
+    C_GREEN_BG   = colors.HexColor("#E7F6ED")
+    C_RED        = colors.HexColor("#E2543D")
+    C_RED_BG     = colors.HexColor("#FCEAE6")
+    C_ORANGE     = colors.HexColor("#E8A53D")
+    C_ORANGE_BG  = colors.HexColor("#FCF2DF")
+    C_PURPLE     = colors.HexColor("#8E5BC4")
+    C_WHITE      = colors.white
+
+    PAGE_W, PAGE_H = A4
+    MARGIN = 1.8 * cm
+
+    # Status determination (logic unchanged from original)
+    if budget > 0:
+        pct = (spent / budget) * 100
+        if spent > budget:
+            status = "OVER BUDGET"
+        elif pct >= 90:
+            status = "CRITICAL (90%+ USED)"
+        elif pct >= 70:
+            status = "CAUTION (70%+ USED)"
+        else:
+            status = "ON TRACK"
+    else:
+        pct = 0
+        status = "NO BUDGET SET"
+
+    status_color_map = {
+        "OVER BUDGET": (C_RED, C_RED_BG),
+        "CRITICAL (90%+ USED)": (C_RED, C_RED_BG),
+        "CAUTION (70%+ USED)": (C_ORANGE, C_ORANGE_BG),
+        "ON TRACK": (C_GREEN, C_GREEN_BG),
+        "NO BUDGET SET": (C_SUBTLE, C_BORDER),
+    }
+    status_color, status_bg = status_color_map[status]
+
+
+    # Header / Footer drawn 
+    def draw_header_footer(c, doc_):
+        c.saveState()
+
+        # Top brand band
+        band_h = 2.6 * cm
+        c.setFillColor(C_ACCENT)
+        c.rect(0, PAGE_H - band_h, PAGE_W, band_h, fill=1, stroke=0)
+        c.setFillColor(C_ACCENT_DK)
+        c.rect(0, PAGE_H - band_h, PAGE_W, 0.12 * cm, fill=1, stroke=0)
+
+        # Brand mark
+        c.setFillColor(C_WHITE)
+        c.circle(MARGIN + 0.45 * cm, PAGE_H - band_h / 2, 0.42 * cm, fill=1, stroke=0)
+        c.setFillColor(C_ACCENT)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawCentredString(MARGIN + 0.45 * cm, PAGE_H - band_h / 2 - 4, "Rs")
+
+        c.setFillColor(C_WHITE)
+        c.setFont("Helvetica-Bold", 15)
+        c.drawString(MARGIN + 1.1 * cm, PAGE_H - band_h / 2 + 2, "Smart Expense Tracker")
+        c.setFont("Helvetica", 8.5)
+        c.drawString(MARGIN + 1.1 * cm, PAGE_H - band_h / 2 - 12, "Monthly Expense Report")
+
+        c.setFont("Helvetica-Bold", 11)
+        c.drawRightString(PAGE_W - MARGIN, PAGE_H - band_h / 2 + 2, f"{month_name} {year}")
+        c.setFont("Helvetica", 8)
+        c.drawRightString(PAGE_W - MARGIN, PAGE_H - band_h / 2 - 12, f"User: {username}")
+
+        # Footer
+        c.setStrokeColor(C_BORDER)
+        c.setLineWidth(0.5)
+        c.line(MARGIN, 1.35 * cm, PAGE_W - MARGIN, 1.35 * cm)
+        c.setFillColor(C_SUBTLE)
+        c.setFont("Helvetica", 7.5)
+        c.drawString(MARGIN, 1.0 * cm, f"Generated on {today.strftime('%d %B %Y')}")
+        c.drawCentredString(PAGE_W / 2, 1.0 * cm, "Smart Expense Tracker — Confidential")
+        c.drawRightString(PAGE_W - MARGIN, 1.0 * cm, f"Page {doc_.page}")
+
+        c.restoreState()
+
+    doc = SimpleDocTemplate(
+        filepath, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=3.1 * cm, bottomMargin=1.8 * cm,
+        title=f"Expense Report - {month_name} {year}",
+        author=username,
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    style_section = ParagraphStyle(
+        "Section", parent=styles["Heading2"],
+        fontName="Helvetica-Bold", fontSize=12.5, leading=15,
+        textColor=C_INK, spaceBefore=4, spaceAfter=8,
+    )
+    style_normal = ParagraphStyle(
+        "BodyText2", parent=styles["Normal"],
+        fontName="Helvetica", fontSize=9.5, leading=14, textColor=C_INK,
+    )
+    style_advice = ParagraphStyle(
+        "Advice", parent=styles["Normal"],
+        fontName="Helvetica", fontSize=10, leading=15, textColor=C_INK,
+    )
+    style_th = ParagraphStyle(
+        "TH", fontName="Helvetica-Bold", fontSize=8.5, leading=11,
+        textColor=C_WHITE, alignment=TA_LEFT,
+    )
+    style_th_c = ParagraphStyle(
+        "THC", parent=style_th, alignment=TA_CENTER,
+    )
+    style_th_r = ParagraphStyle(
+        "THR", parent=style_th, alignment=TA_RIGHT,
+    )
+    style_td = ParagraphStyle(
+        "TD", fontName="Helvetica", fontSize=8.7, leading=11.5, textColor=C_INK,
+    )
+    style_td_c = ParagraphStyle("TDC", parent=style_td, alignment=TA_CENTER)
+    style_td_r = ParagraphStyle("TDR", parent=style_td, alignment=TA_RIGHT)
+    style_td_b = ParagraphStyle("TDB", parent=style_td, fontName="Helvetica-Bold")
+    style_td_br = ParagraphStyle("TDBR", parent=style_td_b, alignment=TA_RIGHT)
+
+    def section_title(text):
+        story.append(Paragraph(text.upper(), style_section))
+        story.append(HRFlowable(width="100%", thickness=1.1, color=C_ACCENT,
+                                 spaceBefore=0, spaceAfter=10))
+
+    #SUMMARY 
+    section_title("Summary")
+
+    summary_inner = Table(
+        [
+            [Paragraph("TOTAL SPENT", style_th_c)],
+            [Paragraph(f"Rs {spent:,.2f}", ParagraphStyle(
+                "SumVal", fontName="Helvetica-Bold", fontSize=15,
+                textColor=C_PURPLE, alignment=TA_CENTER))],
+        ],
+        colWidths=[4.2 * cm],
+    )
+
+    def summary_cell(label, value, value_color):
+        return Table(
+            [[Paragraph(label, ParagraphStyle(
+                "L", fontName="Helvetica-Bold", fontSize=7.6,
+                textColor=C_SUBTLE, alignment=TA_CENTER))],
+             [Paragraph(value, ParagraphStyle(
+                "V", fontName="Helvetica-Bold", fontSize=15,
+                textColor=value_color, alignment=TA_CENTER))]],
+            colWidths=[4.2 * cm],
+        )
+
+    spent_cell = summary_cell("TOTAL SPENT", f"Rs {spent:,.2f}", C_PURPLE)
+    budget_cell = summary_cell(
+        "MONTHLY BUDGET",
+        f"Rs {budget:,.2f}" if budget > 0 else "Not Set",
+        C_ACCENT if budget > 0 else C_SUBTLE)
+    remaining_cell = summary_cell(
+        "REMAINING",
+        f"Rs {remaining:,.2f}" if budget > 0 else "—",
+        (C_GREEN if remaining >= 0 else C_RED) if budget > 0 else C_SUBTLE)
+    status_cell_inner = Table(
+        [[Paragraph("STATUS", ParagraphStyle(
+            "L", fontName="Helvetica-Bold", fontSize=7.6,
+            textColor=C_SUBTLE, alignment=TA_CENTER))],
+         [Paragraph(status, ParagraphStyle(
+            "V", fontName="Helvetica-Bold", fontSize=11.5,
+            textColor=status_color, alignment=TA_CENTER))]],
+        colWidths=[4.6 * cm],
+    )
+
+    summary_row = Table(
+        [[spent_cell, budget_cell, remaining_cell, status_cell_inner]],
+        colWidths=[4.2 * cm, 4.2 * cm, 4.2 * cm, 4.6 * cm],
+    )
+    summary_row.setStyle(TableStyle([
+        ("BOX",        (0, 0), (-1, -1), 0.8, C_BORDER),
+        ("INNERGRID",  (0, 0), (-1, -1), 0.8, C_BORDER),
+        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ("BACKGROUND", (0, 0), (-1, -1), C_ACCENT_BG),
+        ("BACKGROUND", (3, 0), (3, 0), status_bg),
+    ]))
+    story.append(summary_row)
+    story.append(Spacer(1, 0.55 * cm))
+
+    if budget > 0:
+        # Slim progress bar made of a 2-cell table (filled / empty)
+        used_w = max(0.0, min(pct, 100)) / 100 * 17.0
+        empty_w = 17.0 - used_w
+        bar_color = C_GREEN if pct < 70 else (C_ORANGE if pct < 90 else C_RED)
+        if used_w <= 0:
+            bar = Table([[""]], colWidths=[17.0 * cm], rowHeights=[0.45 * cm])
+            bar.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), C_BORDER)]))
+        else:
+            bar = Table([["", ""]], colWidths=[used_w * cm, empty_w * cm], rowHeights=[0.45 * cm])
+            bar.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, 0), bar_color),
+                ("BACKGROUND", (1, 0), (1, 0), C_BORDER),
+            ]))
+        story.append(bar)
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            f"<font color='#{bar_color.hexval()[2:]}'><b>{pct:.1f}%</b></font> "
+            f"<font color='#{C_SUBTLE.hexval()[2:]}'>of monthly budget used</font>",
+            ParagraphStyle("PctLbl", fontName="Helvetica", fontSize=8.3,
+                           textColor=C_SUBTLE, alignment=TA_RIGHT)))
+        story.append(Spacer(1, 0.5 * cm))
+    else:
+        story.append(Spacer(1, 0.15 * cm))
+
+    # CATEGORY BREAKDOWN 
+    section_title("Category Breakdown")
+
+    cat_header = [
+        Paragraph("CATEGORY", style_th),
+        Paragraph("AMOUNT (RS)", style_th_r),
+        Paragraph("% OF TOTAL", style_th_c),
+        Paragraph("SHARE", style_th_c),
+    ]
+    cat_rows = [cat_header]
+    bar_palette = [C_ACCENT, C_PURPLE, C_ORANGE, C_GREEN, C_RED,
+                   C_ACCENT_DK, colors.HexColor("#C97FB0"), colors.HexColor("#5B8DC4")]
+    for i, (cat, amt) in enumerate(cat_totals):
+        share = (amt / spent * 100) if spent > 0 else 0
+        bar_color = bar_palette[i % len(bar_palette)]
+        filled = max(2, int(share / 100 * 60))
+        mini_bar = Table([["", ""]],
+                          colWidths=[filled * 0.06 * cm, max(0.1, (60 - filled)) * 0.06 * cm],
+                          rowHeights=[0.3 * cm])
+        mini_bar.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), bar_color),
+            ("BACKGROUND", (1, 0), (1, 0), C_BORDER),
+        ]))
+        cat_rows.append([
+            Paragraph(cat, style_td_b),
+            Paragraph(f"{amt:,.2f}", style_td_r),
+            Paragraph(f"{share:.1f}%", style_td_c),
+            mini_bar,
+        ])
+
+    cat_table = Table(cat_rows, colWidths=[5.2 * cm, 4.0 * cm, 3.0 * cm, 4.8 * cm], repeatRows=1)
+    cat_style = [
+        ("BACKGROUND", (0, 0), (-1, 0), C_ACCENT),
+        ("TOPPADDING",    (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING",    (0, 1), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.5, C_BORDER),
+        ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+    ]
+    for i in range(1, len(cat_rows)):
+        if i % 2 == 0:
+            cat_style.append(("BACKGROUND", (0, i), (-1, i), C_ROW_ALT))
+    cat_table.setStyle(TableStyle(cat_style))
+    story.append(cat_table)
+    story.append(Spacer(1, 0.6 * cm))
+
+    #TRANSACTION DETAILS 
+    section_title("Transaction Details")
+
+    tx_header = [
+        Paragraph("ID", style_th_c),
+        Paragraph("DATE", style_th),
+        Paragraph("CATEGORY", style_th),
+        Paragraph("DESCRIPTION", style_th),
+        Paragraph("AMOUNT (RS)", style_th_r),
+    ]
+    tx_rows = [tx_header]
+    for r in expenses:
+        tx_rows.append([
+            Paragraph(str(r[0]), style_td_c),
+            Paragraph(r[1], style_td),
+            Paragraph(r[2], style_td),
+            Paragraph(r[3], style_td),
+            Paragraph(f"{r[4]:,.2f}", style_td_r),
+        ])
+
+    tx_table = Table(
+        tx_rows,
+        colWidths=[1.4 * cm, 2.6 * cm, 3.0 * cm, 6.4 * cm, 3.6 * cm],
+        repeatRows=1,
+    )
+    tx_style = [
+        ("BACKGROUND", (0, 0), (-1, 0), C_ACCENT),
+        ("TOPPADDING",    (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING",    (0, 1), (-1, -1), 5.5),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 5.5),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.4, C_BORDER),
+        ("BOX", (0, 0), (-1, -1), 0.8, C_BORDER),
+    ]
+    for i in range(1, len(tx_rows)):
+        if i % 2 == 0:
+            tx_style.append(("BACKGROUND", (0, i), (-1, i), C_ROW_ALT))
+    # Totals footer row
+    tx_rows.append([
+        "", "", "",
+        Paragraph("TOTAL", style_td_b),
+        Paragraph(f"Rs {spent:,.2f}", style_td_br),
+    ])
+    tx_style.append(("SPAN", (0, -1), (2, -1)))
+    tx_style.append(("BACKGROUND", (0, -1), (-1, -1), C_ACCENT_BG))
+    tx_style.append(("LINEABOVE", (0, -1), (-1, -1), 1.1, C_ACCENT))
+    tx_style.append(("TOPPADDING", (0, -1), (-1, -1), 8))
+    tx_style.append(("BOTTOMPADDING", (0, -1), (-1, -1), 8))
+    tx_table = Table(
+        tx_rows,
+        colWidths=[1.4 * cm, 2.6 * cm, 3.0 * cm, 6.4 * cm, 3.6 * cm],
+        repeatRows=1,
+    )
+    tx_table.setStyle(TableStyle(tx_style))
+    story.append(tx_table)
+    story.append(Spacer(1, 0.65 * cm))
+
+    #SMART BUDGET ADVISOR
+    section_title("Smart Budget Advisor")
+
+    if budget == 0:
+        advice = "No budget set. Set a monthly budget to receive spending insights."
+    elif spent > budget:
+        advice = f"<b>OVER BUDGET</b> by Rs {abs(remaining):,.2f}. Stop unnecessary spending immediately."
+    elif pct >= 90:
+        advice = f"<b>CRITICAL:</b> {pct:.1f}% of budget used. Only Rs {remaining:,.2f} left."
+    elif pct >= 70:
+        advice = f"<b>CAUTION:</b> {pct:.1f}% of budget used. Rs {remaining:,.2f} remaining."
+    else:
+        advice = f"<b>ON TRACK:</b> {pct:.1f}% of budget used. Rs {remaining:,.2f} still available."
+
+    advisor_box = Table(
+        [[Paragraph(advice, style_advice)]],
+        colWidths=[17.0 * cm],
+    )
+    advisor_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), status_bg),
+        ("BOX", (0, 0), (-1, -1), 1.0, status_color),
+        ("LEFTPADDING", (0, 0), (-1, -1), 14),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+        ("TOPPADDING", (0, 0), (-1, -1), 12),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    story.append(advisor_box)
+
+    doc.build(story, onFirstPage=draw_header_footer, onLaterPages=draw_header_footer)
+    return True, filepath
 
 
 #PALETTE & TYPOGRAPHY
@@ -755,7 +1180,7 @@ class ExpenseTrackerApp:
 
         pills_frame = tk.Frame(brand_wrap, bg=HERO_BG)
         pills_frame.pack(pady=20)
-        for feat in ["📊 Analytics", "🎯 Budget Goals"]:
+        for feat in ["📊 Analytics", "🎯 Budget Goals", "📄 PDF Reports"]:
             pill = tk.Frame(pills_frame, bg=HERO_GLOW)
             pill.pack(side="left", padx=4, ipadx=10, ipady=5)
             tk.Label(pill, text=feat, font=("Segoe UI", 8),
@@ -943,6 +1368,7 @@ class ExpenseTrackerApp:
             ("✏️  Update / Delete", self.show_update_delete),
             ("🔍  Search",         self.show_search),
             ("🎯  Budget",         self.show_budget),
+            ("📄  PDF Report",     self.show_pdf_report),
         ]
 
         nav_wrap = tk.Frame(sidebar, bg=BG_SURFACE, padx=8)
@@ -1760,6 +2186,139 @@ class ExpenseTrackerApp:
             mini_stat(stats_row, "REMAINING", f"Rs {rem:,.0f}", GREEN if rem >= 0 else RED)
             tk.Frame(stats_row, bg=BORDER, width=1).pack(side="left", fill="y", padx=6)
             mini_stat(stats_row, "USED",      f"{pct:.1f}%", adv_color)
+
+    # PDF REPOR
+    def show_pdf_report(self):
+        self.clear_content()
+        self._highlight_nav("📄  PDF Report")
+
+        self._page_header("PDF Report",
+                          "Generate a monthly expense report — saved to current folder")
+
+        outer = tk.Frame(self.content, bg=BG_DEEP, padx=28, pady=14)
+        outer.pack(fill="both", expand=True)
+
+        card = _card(outer, padx=30, pady=28)
+        card.pack(fill="x")
+
+        today = date.today()
+
+        row1 = tk.Frame(card, bg=BG_SURFACE)
+        row1.pack(fill="x", pady=(0, 4))
+
+        # Year
+        col_year = tk.Frame(row1, bg=BG_SURFACE)
+        col_year.pack(side="left", expand=True, fill="x", padx=(0, 20))
+        tk.Label(col_year, text="YEAR", font=F_LABEL,
+                 bg=BG_SURFACE, fg=TEXT_SECONDARY).pack(anchor="w")
+        year_entry = _entry(col_year, width=14)
+        year_entry.insert(0, str(today.year))
+        year_entry.pack(anchor="w", ipady=8, pady=(4, 0))
+        year_v = FieldValidator(col_year, bg=BG_SURFACE)
+
+        # Month
+        col_month = tk.Frame(row1, bg=BG_SURFACE)
+        col_month.pack(side="left", expand=True, fill="x")
+        tk.Label(col_month, text="MONTH", font=F_LABEL,
+                 bg=BG_SURFACE, fg=TEXT_SECONDARY).pack(anchor="w")
+        month_names_list = [f"{i} — {MONTH_NAMES[i]}" for i in range(1, 13)]
+        month_combo = ttk.Combobox(col_month, values=month_names_list,
+                                    font=F_BODY, width=20, state="readonly")
+        month_combo.current(today.month - 1)
+        month_combo.pack(anchor="w", ipady=5, pady=(4, 0))
+        month_v = FieldValidator(col_month, bg=BG_SURFACE)
+
+        # Status area
+        status_frame = tk.Frame(card, bg=BG_SURFACE)
+        status_frame.pack(fill="x", pady=(16, 0))
+        status_lbl = tk.Label(status_frame, text="", font=("Segoe UI", 10),
+                              bg=BG_SURFACE, fg=TEXT_SECONDARY,
+                              wraplength=580, justify="left")
+        status_lbl.pack(anchor="w")
+
+        def do_generate():
+            from tkinter import filedialog
+            yr_str = year_entry.get().strip()
+            try:
+                yr = int(yr_str)
+                if not (2000 <= yr <= 2100):
+                    raise ValueError
+                year_v.ok()
+            except ValueError:
+                year_v.error("Enter a valid year between 2000 and 2100")
+                return
+
+            mo_raw = month_combo.get()
+            if not mo_raw:
+                month_v.error("Please select a month")
+                return
+            mo = int(mo_raw.split("—")[0].strip())
+            month_v.ok()
+
+            # Open file manager — user chooses where to save
+            default_name = f"Report_{self.username}_{MONTH_NAMES[mo]}_{yr}.pdf"
+            save_path = filedialog.asksaveasfilename(
+                title="Save PDF Report",
+                initialfile=default_name,
+                defaultextension=".pdf",
+                filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+            )
+            if not save_path:
+                return  # user cancelled
+
+            status_lbl.config(text="⏳  Generating PDF…", fg=ACCENT)
+            card.update_idletasks()
+
+            save_dir  = os.path.dirname(save_path)
+            save_name = os.path.basename(save_path)
+
+            success, result = generate_pdf_report(self.uid, yr, mo, save_dir=save_dir or None)
+
+            # Rename if user typed a custom filename
+            if success and os.path.basename(result) != save_name:
+                try:
+                    os.rename(result, save_path)
+                    result = save_path
+                except Exception:
+                    pass
+
+            if success:
+                status_lbl.config(text=f"✅  Saved to:\n{result}", fg=GREEN)
+                self.toast.show("PDF report generated!", color=GREEN)
+            else:
+                status_lbl.config(text=f"❌  {result}", fg=RED)
+                self.toast.show("Failed to generate PDF", color=RED)
+
+        actions = tk.Frame(card, bg=BG_SURFACE)
+        actions.pack(fill="x", pady=(20, 0))
+
+        _btn(actions, "  📄  Generate PDF", do_generate,
+             bg=PURPLE, fg="white").pack(side="left", padx=(0, 10))
+
+        def clear_form():
+            status_lbl.config(text="")
+            year_entry.delete(0, "end")
+            year_entry.insert(0, str(today.year))
+            month_combo.current(today.month - 1)
+            for v in (year_v, month_v):
+                v.clear()
+
+        _btn(actions, "  ↺  Reset", clear_form,
+             bg=BG_ELEVATED, fg=TEXT_SECONDARY).pack(side="left")
+
+        # Info banner
+        info = tk.Frame(outer, bg=ACCENT_GLOW,
+                        highlightbackground=ACCENT, highlightthickness=1,
+                        padx=18, pady=12)
+        info.pack(fill="x", pady=(18, 0))
+        tk.Label(info,
+                 text=(
+                     "📋  Includes: Summary · Category Breakdown · "
+                     "Transaction Details · Smart Budget Advisor\n"
+                      "Click Generate and Save Your PDF"
+                 ),
+                 font=("Segoe UI", 9), bg=ACCENT_GLOW, fg=ACCENT,
+                 justify="left").pack(anchor="w")
 
 
 
